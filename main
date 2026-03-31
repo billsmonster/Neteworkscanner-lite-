@@ -1,0 +1,492 @@
+#!/usr/bin/env python3
+
+"""
+Network Discovery & Port Scanner - Portfolio Version
+====================================================
+
+Purpose:
+    This project demonstrates practical entry-level networking skills through
+    a lightweight Python-based scanner.
+
+Core networking concepts shown:
+    - IPv4 subnet validation and normalization
+    - ARP-based host discovery on a local subnet
+    - TCP connect scanning for common services
+    - Basic banner grabbing for service identification
+    - Optional Shodan enrichment for public-facing intelligence
+    - Multi-threaded scanning for faster enumeration
+    - JSON / CSV / human-readable reporting
+
+Why this is useful in a networking portfolio:
+    This project is designed to emphasize understanding of:
+    - Layer 2 host discovery
+    - Common TCP ports and services
+    - Service enumeration and inventory
+    - Basic network assessment workflow
+
+Authorized Use Only:
+    Only run this scanner on networks and systems you own or have explicit
+    permission to assess.
+"""
+
+# ============================================================
+# Imports
+# ============================================================
+
+# argparse:
+# Used for building a command-line interface so the scanner can accept
+# parameters like subnet, output format, and worker count.
+import argparse
+
+# ipaddress:
+# Used to validate and normalize the user-provided subnet in CIDR notation.
+# This helps ensure the tool scans a proper network range.
+import ipaddress
+
+# json / csv:
+# Used for exporting results in machine-readable and spreadsheet-friendly formats.
+import json
+import csv
+
+# socket:
+# Core networking module used to perform TCP connect scans and banner grabbing.
+import socket
+
+# time:
+# Used for timestamps in the human-readable report.
+import time
+
+# ThreadPoolExecutor / as_completed:
+# Used to scan multiple ports concurrently, which makes the tool faster and
+# more practical on larger host/port sets.
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Type hints improve readability and professionalism.
+from typing import List, Dict, Optional
+
+
+# ============================================================
+# Optional dependencies
+# ============================================================
+
+# Scapy is used for ARP-based discovery.
+# ARP works at Layer 2 and is one of the best ways to identify live hosts
+# on the local broadcast domain.
+try:
+    from scapy.all import ARP, Ether, srp
+except ImportError:
+    ARP = Ether = srp = None
+
+# requests is optional and only needed for Shodan lookups.
+try:
+    import requests
+except ImportError:
+    requests = None
+
+
+# ============================================================
+# Configuration
+# ============================================================
+
+# These are the common ports the scanner will check by default.
+# They were chosen because they represent well-known services commonly seen
+# in enterprise, workstation, and infrastructure environments.
+COMMON_PORTS = [
+    21,   # FTP
+    22,   # SSH
+    23,   # Telnet
+    25,   # SMTP
+    53,   # DNS
+    80,   # HTTP
+    110,  # POP3
+    139,  # NetBIOS Session Service
+    143,  # IMAP
+    443,  # HTTPS
+    445,  # SMB
+    3389  # RDP
+]
+
+# Optional Shodan API key.
+# If you want external enrichment for public-facing IPs, place your key here.
+SHODAN_API_KEY = ""
+
+
+# ============================================================
+# Subnet validation
+# ============================================================
+
+def validate_subnet(subnet: str) -> Optional[str]:
+    """
+    Validate and normalize a subnet provided by the user.
+
+    Example:
+        Input: 192.168.1.25/24
+        Output: 192.168.1.0/24
+
+    Why this matters from a networking perspective:
+        - Demonstrates awareness of CIDR notation
+        - Ensures the input is a real IPv4 network range
+        - Prevents invalid targets from being scanned
+
+    Returns:
+        Normalized subnet string if valid, otherwise None.
+    """
+    try:
+        return str(ipaddress.ip_network(subnet, strict=False))
+    except ValueError:
+        return None
+
+
+# ============================================================
+# ARP-based host discovery
+# ============================================================
+
+def arp_scan(subnet: str) -> List[Dict]:
+    """
+    Perform ARP-based host discovery on the target subnet.
+
+    Networking concept:
+        ARP (Address Resolution Protocol) is a Layer 2 protocol used to map
+        IPv4 addresses to MAC addresses on the local network segment.
+
+    Why ARP is valuable here:
+        - It is often more reliable than ping on a local subnet
+        - It directly shows which hosts answered on the broadcast domain
+        - It provides both IP and MAC address information
+
+    Returns:
+        A list of dictionaries like:
+            [{"ip": "192.168.1.10", "mac": "aa:bb:cc:dd:ee:ff"}, ...]
+
+    Notes:
+        - This works best on the local subnet / local Layer 2 segment
+        - Scapy must be installed for this function to work
+    """
+    if not srp:
+        print("[ERROR] Scapy not installed: pip install scapy")
+        return []
+
+    try:
+        # Build an Ethernet broadcast frame carrying an ARP request.
+        # Destination ff:ff:ff:ff:ff:ff means "send to everyone on the LAN".
+        pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=subnet)
+
+        # Send and receive packets at Layer 2.
+        # answered is the list of ARP replies that came back.
+        answered = srp(pkt, timeout=3, verbose=0)[0]
+
+        # Extract the responding host IP and MAC address from each ARP reply.
+        return [{"ip": r.psrc, "mac": r.hwsrc} for _, r in answered]
+
+    except Exception as e:
+        print(f"[ERROR] ARP scan failed: {e}")
+        return []
+
+
+# ============================================================
+# TCP port scanning
+# ============================================================
+
+def tcp_scan(ip: str, ports: List[int], max_workers: int = 50) -> List[Dict]:
+    """
+    Perform a TCP connect scan against a list of ports on a single host.
+
+    Networking concept:
+        A TCP connect scan attempts to complete a normal TCP connection to
+        a target port. If the connection succeeds, the port is considered open.
+
+    Why this matters:
+        - Demonstrates knowledge of TCP service discovery
+        - Helps identify what services may be exposed on a host
+        - Mimics a basic but realistic network assessment workflow
+
+    Banner grabbing:
+        For a few common ports, the function also attempts to collect a small
+        banner or response snippet. This can help identify the service further.
+
+    Args:
+        ip: Target host IP
+        ports: List of ports to scan
+        max_workers: Number of worker threads for concurrent scanning
+
+    Returns:
+        Sorted list of open port dictionaries
+    """
+
+    def scan_port(port: int) -> Optional[Dict]:
+        """
+        Scan a single TCP port on the target host.
+
+        Returns:
+            Dictionary with port/service/banner if open, otherwise None.
+        """
+        # Create an IPv4 TCP socket.
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+        # Set a short timeout so the scan does not hang too long on each port.
+        sock.settimeout(1)
+
+        try:
+            # connect_ex returns 0 if the TCP connection succeeds.
+            # That means the remote service accepted the connection.
+            if sock.connect_ex((ip, port)) == 0:
+
+                # Try to resolve the standard service name for well-known ports.
+                # For ports above 1024, we just label them unknown by default.
+                service = socket.getservbyport(port, "tcp") if port < 1024 else "unknown"
+
+                # Banner grabbing can reveal useful service/application details.
+                banner = ""
+
+                # Try a simple request on a few common ports.
+                # This is very lightweight and meant for identification, not exploitation.
+                if port in (21, 22, 23, 80, 443):
+                    try:
+                        sock.sendall(b"HEAD / HTTP/1.0\r\n\r\n")
+                        banner = sock.recv(256).decode(errors="ignore").strip()[:100]
+                    except:
+                        pass
+
+                return {
+                    "port": port,
+                    "service": service,
+                    "banner": banner or None
+                }
+
+        finally:
+            # Always close the socket to avoid leaking resources.
+            sock.close()
+
+        return None
+
+    open_ports = []
+
+    # Use a thread pool so multiple ports can be scanned at once.
+    # This improves performance significantly compared to scanning ports serially.
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for future in as_completed(ex.submit(scan_port, p) for p in ports):
+            if result := future.result():
+                open_ports.append(result)
+
+    # Return results sorted numerically by port number.
+    return sorted(open_ports, key=lambda x: x["port"])
+
+
+# ============================================================
+# Optional Shodan enrichment
+# ============================================================
+
+def shodan_lookup(ip: str) -> Dict:
+    """
+    Query Shodan for additional intelligence about a host.
+
+    Why this can be useful:
+        - Adds organization, OS, hostnames, and vulnerability information
+        - Helps enrich results for public-facing systems
+        - Shows awareness of external reconnaissance data sources
+
+    Important note:
+        Shodan is generally relevant for public-facing IPs, not private lab IPs.
+
+    Returns:
+        Dictionary containing Shodan data, or an error message.
+    """
+    if not requests or not SHODAN_API_KEY:
+        return {"error": "Shodan disabled"}
+
+    try:
+        r = requests.get(
+            f"https://api.shodan.io/shodan/host/{ip}?key={SHODAN_API_KEY}",
+            timeout=8
+        )
+
+        data = r.json() if r.status_code == 200 else {}
+
+        vulns = data.get("vulns", [])
+        if isinstance(vulns, dict):
+            vulns = list(vulns.keys())
+
+        return {
+            "org": data.get("org", ""),
+            "os": data.get("os", ""),
+            "hostnames": data.get("hostnames", []),
+            "vulns": vulns
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ============================================================
+# Output and reporting
+# ============================================================
+
+def save_results(results: List[Dict], base: str, fmt: str, subnet: str):
+    """
+    Save scan results in:
+        - JSON or CSV
+        - Human-readable report
+
+    Why this matters:
+        - JSON is useful for structured parsing or future automation
+        - CSV is useful for spreadsheet review and inventory sorting
+        - Text report is useful for portfolio screenshots and readable summaries
+    """
+
+    # --------------------------------------------------------
+    # Save JSON output
+    # --------------------------------------------------------
+    if fmt == "json":
+        with open(f"{base}.json", "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=4)
+
+    # --------------------------------------------------------
+    # Save CSV output
+    # --------------------------------------------------------
+    else:
+        with open(f"{base}.csv", "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+
+            # Header row
+            writer.writerow(["IP", "MAC", "Port", "Service", "Banner", "Org", "OS", "Vulns"])
+
+            for host in results:
+                # Pull Shodan fields only if present and valid
+                sh = host.get("shodan", {}) if isinstance(host.get("shodan"), dict) else {}
+                vulns = "; ".join(sh.get("vulns", []))
+                org, os_ = sh.get("org", ""), sh.get("os", "")
+
+                # Write one row per open port
+                for p in host.get("open_ports", []):
+                    writer.writerow([
+                        host["ip"],
+                        host["mac"],
+                        p["port"],
+                        p["service"],
+                        p.get("banner", "")[:50],
+                        org,
+                        os_,
+                        vulns
+                    ])
+
+                # If no ports are open, still write a host row
+                if not host.get("open_ports"):
+                    writer.writerow([host["ip"], host["mac"], "", "", "", org, os_, vulns])
+
+    # --------------------------------------------------------
+    # Save human-readable text report
+    # --------------------------------------------------------
+    with open(f"{base}_report.txt", "w", encoding="utf-8") as f:
+        f.write(f"NETWORK SCAN REPORT - {subnet}\n")
+        f.write("=" * 55 + f"\nHosts Found: {len(results)} | {time.strftime('%Y-%m-%d %H:%M')}\n\n")
+
+        for host in results:
+            f.write(f"Host: {host['ip']} | MAC: {host['mac']}\n")
+
+            sh = host.get("shodan", {})
+
+            # Only include Shodan fields if they were successfully collected
+            if isinstance(sh, dict) and "error" not in sh:
+                if sh.get("org"):
+                    f.write(f"  Org : {sh['org']}\n")
+                if sh.get("os"):
+                    f.write(f"  OS  : {sh['os']}\n")
+                if sh.get("vulns"):
+                    f.write(f"  Vulns: {', '.join(sh['vulns'])}\n")
+
+            ports = host.get("open_ports", [])
+
+            f.write("  Open Ports:\n" if ports else "  Open Ports: None\n")
+
+            for p in ports:
+                banner = f" | {p['banner'][:60]}" if p.get("banner") else ""
+                f.write(f"    {p['port']:>5} ({p['service']}){banner}\n")
+
+            f.write("\n")
+
+
+# ============================================================
+# Main program flow
+# ============================================================
+
+def main():
+    """
+    Main execution flow:
+
+    1. Parse command-line arguments
+    2. Validate the subnet
+    3. Perform ARP host discovery
+    4. Scan each discovered host for common TCP ports
+    5. Optionally enrich results with Shodan
+    6. Save results to files
+
+    This flow mirrors a simple real-world network discovery process:
+        discover hosts -> enumerate services -> document findings
+    """
+
+    # Build the command-line interface
+    parser = argparse.ArgumentParser(description="Fast network discovery scanner")
+    parser.add_argument("subnet", nargs="?", help="Target subnet (e.g. 192.168.1.0/24)")
+    parser.add_argument("-f", "--format", choices=["json", "csv"], default="json")
+    parser.add_argument("-o", "--output", default="network_scan")
+    parser.add_argument("--shodan", action="store_true", help="Enable Shodan lookup")
+    parser.add_argument("-w", "--workers", type=int, default=50)
+    args = parser.parse_args()
+
+    # If subnet was not passed via CLI, ask interactively
+    if not args.subnet:
+        args.subnet = input("Enter target subnet (e.g. 192.168.1.0/24): ").strip()
+
+    # Validate and normalize the subnet
+    subnet = validate_subnet(args.subnet)
+    if not subnet:
+        print("[ERROR] Invalid subnet")
+        return
+
+    print(f"[INFO] Scanning {subnet}...")
+
+    # --------------------------------------------------------
+    # Phase 1: Host discovery
+    # --------------------------------------------------------
+    # Use ARP to identify live hosts on the local subnet.
+    hosts = arp_scan(subnet)
+
+    if not hosts:
+        print("[INFO] No live hosts found.")
+        return
+
+    print(f"[INFO] Found {len(hosts)} live hosts. Starting port scan...")
+
+    # --------------------------------------------------------
+    # Phase 2: Per-host TCP service scan
+    # --------------------------------------------------------
+    results = []
+
+    for h in hosts:
+        print(f"  → Scanning {h['ip']}")
+
+        record = {
+            "ip": h["ip"],
+            "mac": h["mac"],
+            "open_ports": tcp_scan(h["ip"], COMMON_PORTS, args.workers)
+        }
+
+        # ----------------------------------------------------
+        # Phase 3: Optional external enrichment
+        # ----------------------------------------------------
+        if args.shodan:
+            record["shodan"] = shodan_lookup(h["ip"])
+
+        results.append(record)
+
+    # --------------------------------------------------------
+    # Phase 4: Save outputs
+    # --------------------------------------------------------
+    save_results(results, args.output, args.format, subnet)
+
+    print(f"\n[INFO] Scan complete. Results saved to {args.output}.* and {args.output}_report.txt")
+
+
+# Standard Python entry point
+if __name__ == "__main__":
+    main()
