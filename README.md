@@ -55,4 +55,4 @@ This scanner shows my understanding of:
 - how service inventory can be documented and exported
 - how external intelligence sources like Shodan can enrich findings
 
-## How
+
